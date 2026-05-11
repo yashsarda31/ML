@@ -14,7 +14,6 @@ from datetime import timedelta
 
 st.set_page_config(page_title="Forecast Lab", page_icon="◐", layout="wide")
 
-# --- Apple-style CSS ---
 st.markdown("""
 <style>
 html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", Inter, sans-serif; }
@@ -29,7 +28,6 @@ html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "SF
 st.markdown("<div class='big'>Forecast Lab</div>", unsafe_allow_html=True)
 st.caption("SARIMAX + LSTM with López de Prado safeguards. Educational use only.")
 
-# --- Core quant functions ---
 def frac_diff(series, d=0.4, thres=1e-5):
     w = [1.]
     for k in range(1, len(series)):
@@ -37,13 +35,15 @@ def frac_diff(series, d=0.4, thres=1e-5):
         if abs(w_) < thres: break
         w.append(w_)
     w = np.array(w[::-1])
-    return pd.Series(np.convolve(series, w, mode='valid'),
-                     index=series.iloc[len(w)-1:].index)
+    return pd.Series(np.convolve(series, w, mode='valid'), index=series.iloc[len(w)-1:].index)
 
 @st.cache_data(show_spinner=False)
 def get_data(ticker, period):
     df = yf.download(ticker, period=period, interval='1d', auto_adjust=True, progress=False)
-    if df.empty: raise ValueError("No data")
+    if df.empty:
+        raise ValueError("No data returned")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     return df
 
 def compute_features(df):
@@ -68,34 +68,16 @@ def purged_split(df, test_size=0.2, embargo=10):
     start = int(n * (1-test_size))
     return df.iloc[:start-embargo], df.iloc[start:]
 
-@st.cache_resource(show_spinner=False)
-def fit_sarimax(y_train, X_train):
-    m = SARIMAX(y_train, exog=X_train, order=(1,0,1), seasonal_order=(1,0,1,5),
-                enforce_stationarity=False, enforce_invertibility=False)
-    return m.fit(disp=False)
-
 def run_sarimax(df, horizon):
     y = df['log_ret']; X = df[['atr','rsi']]
     train,_ = purged_split(pd.concat([y,X],1))
-    res = fit_sarimax(train['log_ret'], train[['atr','rsi']])
+    model = SARIMAX(train['log_ret'], exog=train[['atr','rsi']], order=(1,0,1),
+                    seasonal_order=(1,0,1,5), enforce_stationarity=False, enforce_invertibility=False)
+    res = model.fit(disp=False)
     last_exog = X.iloc[-1:].values
     fut_exog = np.repeat(last_exog, horizon, axis=0)
     fc = res.get_forecast(steps=horizon, exog=fut_exog)
     return fc.predicted_mean.values
-
-@st.cache_resource(show_spinner=False)
-def fit_lstm(X_train, y_train, lookback):
-    model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=(lookback,3)),
-        Dropout(0.2),
-        LSTM(32),
-        Dropout(0.2),
-        Dense(1)
-    ])
-    model.compile('adam','mse')
-    model.fit(X_train, y_train, epochs=25, batch_size=32, verbose=0,
-              validation_split=0.1, callbacks=[EarlyStopping(patience=4, restore_best_weights=True)])
-    return model
 
 def run_lstm(df, horizon, lookback):
     feat = df[['log_ret','atr','rsi']].values
@@ -108,7 +90,16 @@ def run_lstm(df, horizon, lookback):
     for i in range(lookback, split):
         Xs.append(fs[i-lookback:i]); ys.append(target[i])
     Xs, ys = np.array(Xs), np.array(ys)
-    model = fit_lstm(Xs, ys, lookback)
+    model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=(lookback,3)),
+        Dropout(0.2),
+        LSTM(32),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    model.compile('adam','mse')
+    model.fit(Xs, ys, epochs=25, batch_size=32, verbose=0,
+              validation_split=0.1, callbacks=[EarlyStopping(patience=4, restore_best_weights=True)])
     seq = fs[-lookback:].copy()
     preds = []
     for _ in range(horizon):
@@ -118,7 +109,6 @@ def run_lstm(df, horizon, lookback):
         seq = np.vstack([seq[1:], new])
     return np.array(preds)
 
-# --- Sidebar ---
 with st.sidebar:
     st.header("Settings")
     ticker = st.text_input("Ticker", "AAPL")
@@ -132,22 +122,27 @@ if not run:
     st.info("Enter a ticker and press Run Forecast.")
     st.stop()
 
-# --- Load ---
 try:
     with st.spinner("Downloading data"):
         raw = get_data(ticker, period)
         df = compute_features(raw)
+        if len(df) < lookback + 50:
+            st.error("Not enough history for this lookback"); st.stop()
 except Exception as e:
     st.error(f"Data error: {e}"); st.stop()
 
-last = df.iloc[-1]
-c1,c2,c3,c4 = st.columns(4)
-with c1: st.markdown(f"<div class='card'><div class='metric'>Last Close</div><div class='big'>{last['Close']:.2f}</div></div>", unsafe_allow_html=True)
-with c2: st.markdown(f"<div class='card'><div class='metric'>Log Return</div><div class='big'>{last['log_ret']*100:.2f}%</div></div>", unsafe_allow_html=True)
-with c3: st.markdown(f"<div class='card'><div class='metric'>ATR(14)</div><div class='big'>{last['atr']:.2f}</div></div>", unsafe_allow_html=True)
-with c4: st.markdown(f"<div class='card'><div class='metric'>RSI(14)</div><div class='big'>{last['rsi']:.1f}</div></div>", unsafe_allow_html=True)
+last_row = df.iloc[-1]
+last_close = float(raw['Close'].iloc[-1])
+last_logret = float(last_row['log_ret'])
+last_atr = float(last_row['atr'])
+last_rsi = float(last_row['rsi'])
 
-# --- Forecasts ---
+c1,c2,c3,c4 = st.columns(4)
+with c1: st.markdown(f"<div class='card'><div class='metric'>Last Close</div><div class='big'>{last_close:.2f}</div></div>", unsafe_allow_html=True)
+with c2: st.markdown(f"<div class='card'><div class='metric'>Log Return</div><div class='big'>{last_logret*100:.2f}%</div></div>", unsafe_allow_html=True)
+with c3: st.markdown(f"<div class='card'><div class='metric'>ATR(14)</div><div class='big'>{last_atr:.2f}</div></div>", unsafe_allow_html=True)
+with c4: st.markdown(f"<div class='card'><div class='metric'>RSI(14)</div><div class='big'>{last_rsi:.1f}</div></div>", unsafe_allow_html=True)
+
 results = {}
 if "SARIMAX" in models:
     with st.spinner("Fitting SARIMAX"):
@@ -156,13 +151,11 @@ if "LSTM" in models:
     with st.spinner("Training LSTM"):
         results['LSTM'] = run_lstm(df, horizon, lookback)
 
-# Build price paths
-last_price = float(raw['Close'].iloc[-1])
 future_idx = [raw.index[-1] + timedelta(days=i+1) for i in range(horizon)]
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=raw.index, y=raw['Close'], name='History', line=dict(width=2)))
 for name, preds in results.items():
-    price_path = last_price * np.exp(np.cumsum(preds))
+    price_path = last_close * np.exp(np.cumsum(preds))
     fig.add_trace(go.Scatter(x=future_idx, y=price_path, name=name, line=dict(width=2, dash='dot')))
 fig.update_layout(margin=dict(l=0,r=0,t=30,b=0), height=420, legend=dict(orientation='h'), template='plotly_white')
 st.plotly_chart(fig, use_container_width=True)
@@ -172,7 +165,7 @@ with tab1:
     out = pd.DataFrame({'date': future_idx})
     for k,v in results.items():
         out[k+'_logret'] = v
-        out[k+'_price'] = last_price * np.exp(np.cumsum(v))
+        out[k+'_price'] = last_close * np.exp(np.cumsum(v))
     st.dataframe(out, use_container_width=True, height=300)
     st.download_button("Download CSV", out.to_csv(index=False), "forecast.csv")
 with tab2:
